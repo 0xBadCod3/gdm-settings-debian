@@ -1,0 +1,226 @@
+name: Build gdm-settings DEB
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Get latest upstream release
+        id: upstream
+        run: |
+          API="https://api.github.com/repos/gdm-settings/gdm-settings/releases/latest"
+          RELEASE_JSON=$(curl -s "$API")
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          TARBALL=$(echo "$RELEASE_JSON" | jq -r '.tarball_url')
+          VERSION=$(echo "$TAG" | sed 's/^v//')
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tarball=$TARBALL" >> $GITHUB_OUTPUT
+
+          echo "Found upstream version: $VERSION (tag: $TAG)"
+
+      - name: Check if already built
+        id: check
+        run: |
+          EXISTING=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/tags/all" \
+            | jq -r '.assets[].name' \
+            | grep "gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb" || true)
+
+          if [ -n "$EXISTING" ]; then
+            echo "already_built=true" >> $GITHUB_OUTPUT
+            echo "Version ${{ steps.upstream.outputs.version }} already built, skipping..."
+          else
+            echo "already_built=false" >> $GITHUB_OUTPUT
+            echo "Version ${{ steps.upstream.outputs.version }} not found, will build..."
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            gdm3 polkitd pkexec \
+            libadwaita-1-dev libglib2.0-dev libglib2.0-dev-bin \
+            python3-gi python-gi-dev gettext \
+            libgirepository-1.0-dev gir1.2-gtk-3.0 gir1.2-glib-2.0 \
+            gir1.2-gtk-4.0 gir1.2-adw-1 \
+            meson gobject-introspection ninja-build pkg-config blueprint-compiler
+
+      - name: Download upstream tarball
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          mkdir src
+          curl -L "${{ steps.upstream.outputs.tarball }}" -o source.tar.gz
+          tar -xzf source.tar.gz --strip-components=1 -C src
+
+      - name: Build with Meson
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          cd src
+          meson setup build --prefix=/usr --wrap-mode=nofallback
+          meson compile -C build
+
+      - name: Install to staging directory
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          cd src
+          mkdir -p ../debroot
+          DESTDIR=$(pwd)/../debroot meson install -C build --skip-subprojects
+
+      - name: Verify installation
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          echo "Checking for schema files"
+          find debroot -name "*.gschema.xml"
+          echo ""
+          echo "Schemas directory contents"
+          ls -la debroot/usr/share/glib-2.0/schemas/
+          echo ""
+          echo "Binary location"
+          ls -la debroot/usr/bin/gdm-settings
+
+      - name: Create DEBIAN control file
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          mkdir -p debroot/DEBIAN
+          cat > debroot/DEBIAN/control <<EOF
+          Package: gdm-settings
+          Version: ${{ steps.upstream.outputs.version }}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Auto Builder <noreply@example.com>
+          Depends: gdm3, polkitd, pkexec, libadwaita-1-0, libglib2.0-0, libglib2.0-bin, python3-gi, gir1.2-adw-1, gir1.2-gtk-4.0, gir1.2-glib-2.0
+          Description: A settings app for GNOME's Login Manager (GDM)
+           GUI application to configure GDM settings such as themes, fonts,
+           background images, and more for the GNOME login screen.
+           .
+           Built from upstream release ${{ steps.upstream.outputs.tag }}
+          EOF
+
+      - name: Create postinst script
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          cat > debroot/DEBIAN/postinst <<'EOF'
+          #!/bin/sh
+          set -e
+          
+          case "$1" in
+              configure)
+                  if [ -d /usr/share/glib-2.0/schemas ]; then
+                      glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null || true
+                  fi
+          
+                  if command -v update-desktop-database >/dev/null 2>&1; then
+                      update-desktop-database -q /usr/share/applications 2>/dev/null || true
+                  fi
+          
+                  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+                      gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
+                  fi
+                  ;;
+          esac
+          
+          exit 0
+          EOF
+          chmod 755 debroot/DEBIAN/postinst
+
+      - name: Create postrm script
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          cat > debroot/DEBIAN/postrm <<'EOF'
+          #!/bin/sh
+          set -e
+          
+          case "$1" in
+              remove|purge)
+                  if [ -d /usr/share/glib-2.0/schemas ]; then
+                      glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null || true
+                  fi
+          
+                  if command -v update-desktop-database >/dev/null 2>&1; then
+                      update-desktop-database -q /usr/share/applications 2>/dev/null || true
+                  fi
+          
+                  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+                      gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
+                  fi
+                  ;;
+          esac
+          
+          exit 0
+          EOF
+          chmod 755 debroot/DEBIAN/postrm
+
+      - name: Create triggers file
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          cat > debroot/DEBIAN/triggers <<'EOF'
+          interest-noawait /usr/share/glib-2.0/schemas
+          interest-noawait /usr/share/applications
+          interest-noawait /usr/share/icons/hicolor
+          EOF
+
+      - name: Build DEB package
+        if: steps.check.outputs.already_built == 'false'
+        run: |
+          dpkg-deb --build --root-owner-group debroot gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb
+
+          echo "Package created"
+          ls -lh gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb
+
+          echo "Package contents"
+          dpkg-deb -c gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb | grep -E "(gschema|gdm-settings|bin/)"
+
+      - name: Create or update release
+        if: steps.check.outputs.already_built == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: all
+          name: "GDM Settings - All Versions"
+          body: |
+            ## GDM Settings DEB Packages
+
+            Auto-built DEB packages from upstream releases.
+
+            ## Latest Version
+            - **Version**: ${{ steps.upstream.outputs.version }}
+            - **Upstream Tag**: ${{ steps.upstream.outputs.tag }}
+            - **Built**: ${{ github.run_id }}
+
+            ## Installation
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/all/gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb
+            sudo dpkg -i gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb
+            sudo apt install -f
+            ```
+
+            ## Compatibility
+            - Ubuntu 24.04+ / Debian
+            - GNOME 45+
+
+          files: |
+            gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.already_built }}" = "true" ]; then
+            echo "### Skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "Version ${{ steps.upstream.outputs.version }} already exists" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Success" >> "$GITHUB_STEP_SUMMARY"
+            echo "Built and released gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "[Download here](https://github.com/${{ github.repository }}/releases/download/all/gdm-settings_${{ steps.upstream.outputs.version }}_amd64.deb)" >> "$GITHUB_STEP_SUMMARY"
+          fi
